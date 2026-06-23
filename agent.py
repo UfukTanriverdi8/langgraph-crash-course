@@ -134,6 +134,10 @@ def rag_node(state: State):
 
 ## --- Code Node --- ##
 
+def prepare_coding_prompt(state: State):
+    # TODO: Implement a function that prepares the coding prompt for Claude Code. This could involve formatting the user's request, adding any necessary context.
+    return {}
+
 def accept_edits(state: State):
     user_prompt = state["messages"][-1].content
     
@@ -142,12 +146,12 @@ def accept_edits(state: State):
     decision_text = str(decision).strip().lower()
 
     if decision_text in ("yes", "y", "approve", "ok", "okay"):
-        return {}
+        return {"next_node": None}
     
     if decision_text in ("no", "n", "reject", "deny"):
-        return {"messages": [AIMessage(content="Request rejected. Please provide a new prompt or clarify your request.")], "next_node": "edit_denied"}
+        return {"messages": [AIMessage(content="Request rejected.")], "next_node": "edit_denied"}
 
-    return {"messages": [HumanMessage(content=user_prompt)]}
+    return {"messages": [HumanMessage(content=decision_text)], "next_node": "revise"}
 
 
 def code_node(state: State):
@@ -156,7 +160,7 @@ def code_node(state: State):
     workspace = os.path.join(os.getcwd(), "workspace")
 
     result = subprocess.run(
-        ["claude", "-p", user_prompt, "--permission-mode", "acceptEdits"],
+        ["claude", "-p", f"You are only allowed to work in {workspace}, here is what user says: {user_prompt}", "--permission-mode", "acceptEdits"],
         cwd=workspace,
         capture_output=True,
         text=True,
@@ -178,10 +182,19 @@ graph.add_node(code_node)
 graph.add_node(accept_edits)
 
 graph.add_edge(START, "classify_intent")
+def route_after_approval(state: State):
+    match state.get("next_node"):
+        case "edit_denied":
+            return END
+        case "revise":
+            return "accept_edits"
+        case _:
+            return "code_node"
+
 graph.add_conditional_edges(
     "accept_edits",
-    lambda state: END if state.get("next_node") == "edit_denied" else "code_node",
-    path_map=[END, "code_node"],
+    route_after_approval,
+    path_map=[END, "accept_edits", "code_node"],
 )
 graph.add_conditional_edges(
     "classify_intent",
