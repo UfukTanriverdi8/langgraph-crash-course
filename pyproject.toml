@@ -1,7 +1,7 @@
 [project]
 name = "langgraph-crash-course"
 version = "0.1.0"
-description = "Add your description here"
+description = "Building a simple agent by following the crash course of NeuralNine"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

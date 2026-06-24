@@ -33,7 +33,7 @@ embeddings = OpenAIEmbeddings(
 base_system_message = SystemMessage(content=(
     "Give accurate and short answers to the user."
 ))
-# ── Step 1: Define the State ──────────────────────────────────────────
+# Define the State ──────────────────────────────────────────
 # 
 # Instead of using the pre-built MessagesState, we define our OWN state.
 # This lets us add extra fields beyond just "messages".
@@ -43,7 +43,7 @@ class State(TypedDict):
     message_intent: str | None
     next_node: str | None
 
-# ── Step 2: Structured Output for Classification ─────────────────────
+# ── Structured Output for Classification ─────────────────────
 #
 # We use Pydantic to define the EXACT shape of the classifier's response.
 # with_structured_output() forces the LLM to return this shape — no free-text.
@@ -53,7 +53,7 @@ class IntentClassifier(BaseModel):
     "or is asking for code help. Must be one of 'chat', 'rag', or 'code'.")
 
 
-# ── Step 3: The Classifier Node ──────────────────────────────────────
+# ── The Classifier Node ──────────────────────────────────────
 
 def classify_intent(state: State):
     classifier = model.with_structured_output(IntentClassifier)
@@ -65,13 +65,15 @@ def classify_intent(state: State):
             "- 'rag': Questions that require searching a knowledge base or database, particularly the gaming related questions\n"
             "- 'code': Requests to write, modify, or execute code/files"
         )),
-        state["messages"][-1   ].content,
+        state["messages"][-1].content,
     ]))
 
     return {"message_intent": response.message_intent}
 
 
-# ── Step 4: The Route Function, not a Node (for Conditional Edges) ───────────────
+# ── The Route Functions for Conditional Edges ───────────────
+
+## --- Route based on the message intent --- ##
 
 def route_by_message_intent(state: State):
     match state["message_intent"]: 
@@ -80,10 +82,21 @@ def route_by_message_intent(state: State):
         case "rag":
             return "rag_node"
         case _:
-            return "accept_edits"
+            return "prepare_coding_prompt"
+        
+## --- Route after the human approval step of code node --- ##
+
+def route_after_approval(state: State):
+    match state.get("next_node"):
+        case "edit_denied":
+            return END
+        case "revise":
+            return "prepare_coding_prompt"
+        case _:
+            return "code_node"
 
 
-# ── Step 5: The Three Specialized Nodes (stubs for now) ──────────────
+# ── The Three Specialized Nodes (stubs for now) ──────────────
 
 ## --- Chat Node --- ##
 
@@ -95,7 +108,9 @@ def chat_node(state: State):
     ])
     return {"messages": [response]}
 
-## --- RAG Node with a basic vector store --- ##
+## --- RAG Node with a basic knowledge base --- ##
+
+### -- Knowledge Base --- ###
 
 KNOWLEDGE = [
     "Speedrunning is a popular gaming challenge where players try to complete a game as fast as possible, often using glitches and optimized routes.",
@@ -113,6 +128,7 @@ KNOWLEDGE = [
 vector_store = InMemoryVectorStore(embedding=embeddings)
 vector_store.add_texts(KNOWLEDGE)
 
+### -- RAG Node itself --- ###
 
 def rag_node(state: State):
     query = state["messages"][-1].content
@@ -132,11 +148,32 @@ def rag_node(state: State):
     return {"messages": [response]}
 
 
-## --- Code Node --- ##
+## --- Code Node with the Prompt Preparation and Accept Edits nodes --- ##
+
+### -- Preparing the prompt for Claude Code based on the conversation context --- ###
 
 def prepare_coding_prompt(state: State):
-    # TODO: Implement a function that prepares the coding prompt for Claude Code. This could involve formatting the user's request, adding any necessary context.
-    return {}
+    user_prompt = state["messages"][-1].content
+
+    conversation_context = "\n".join(
+        f"{('User' if isinstance(m, HumanMessage) else 'Assistant')}: {m.content}"
+        for m in state["messages"][-6:]
+    )
+
+    rewritten_prompt = model.invoke([
+        base_system_message,
+        SystemMessage(content=(
+            "Your task is to turn the latest user prompt into a clear, standalone instruction "
+            "that can be sent to Claude Code. Use the conversation context to resolve any "
+            "ambiguous references (like 'it', 'that file', 'my name'). "
+            "Output only the rewritten prompt, nothing else."
+        )),
+        HumanMessage(content=f"Conversation context:\n{conversation_context}\n\nLatest prompt:\n{user_prompt}"),
+    ])
+
+    return {"messages": [HumanMessage(content=str(rewritten_prompt.content))]}
+
+### -- Human in the loop for approval of the rewritten prompt --- ###
 
 def accept_edits(state: State):
     user_prompt = state["messages"][-1].content
@@ -153,6 +190,7 @@ def accept_edits(state: State):
 
     return {"messages": [HumanMessage(content=decision_text)], "next_node": "revise"}
 
+### -- The Code Node that executes the code using Claude Code --- ###
 
 def code_node(state: State):
     user_prompt = state["messages"][-1].content
@@ -171,7 +209,7 @@ def code_node(state: State):
     return {"messages": [AIMessage(content=output)]}
 
 
-# — Step 6: Build the Graph ──────────────────────────────────────────
+# — Build the Graph ──────────────────────────────────────────
 
 graph = StateGraph(State)
 
@@ -180,28 +218,21 @@ graph.add_node(chat_node)
 graph.add_node(rag_node)
 graph.add_node(code_node)
 graph.add_node(accept_edits)
+graph.add_node(prepare_coding_prompt)
 
 graph.add_edge(START, "classify_intent")
-def route_after_approval(state: State):
-    match state.get("next_node"):
-        case "edit_denied":
-            return END
-        case "revise":
-            return "accept_edits"
-        case _:
-            return "code_node"
-
 graph.add_conditional_edges(
     "accept_edits",
     route_after_approval,
-    path_map=[END, "accept_edits", "code_node"],
+    path_map=[END, "prepare_coding_prompt", "code_node"],
 )
 graph.add_conditional_edges(
     "classify_intent",
     route_by_message_intent,
-    path_map=["chat_node", "rag_node", "accept_edits"],
+    path_map=["chat_node", "rag_node", "prepare_coding_prompt"],
 )
 
+graph.add_edge("prepare_coding_prompt", "accept_edits")
 graph.add_edge("chat_node", END)
 graph.add_edge("rag_node", END)
 graph.add_edge("code_node", END)
@@ -210,9 +241,10 @@ memory = MemorySaver()
 app = graph.compile(checkpointer=memory)
 
 # visualize the graph
-app.get_graph().draw_mermaid_png(output_file_path="graph.png")
+visualization_output_path = "graph.png"
+app.get_graph().draw_mermaid_png(output_file_path=visualization_output_path)
 
-print("Graph visualization saved as graph.png")
+print(f"Graph visualization saved as {visualization_output_path}")
 
 
 # ── Run it ───────────────────────────────────────────────────────────
